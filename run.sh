@@ -16,8 +16,8 @@ fi
 echo "✅ Activando entorno virtual..."
 source .venv/bin/activate
 
-# Instalar dependencias si no existen
-if ! pip show fastapi > /dev/null; then
+# Instalar dependencias si falta FastAPI o el controlador MySQL
+if ! python -c "import fastapi, pymysql, dotenv" 2>/dev/null; then
     echo "📚 Instalando dependencias..."
     pip install -r requirements.txt
 fi
@@ -27,6 +27,7 @@ echo ""
 echo "========================================"
 echo "🌐 Iniciando servidor en http://localhost:8000"
 echo "📚 Documentación: http://localhost:8000/docs"
+echo "🗄️  Base de datos: MySQL"
 echo "========================================"
 echo ""
 

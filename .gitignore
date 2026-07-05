@@ -48,10 +48,12 @@ venv.bak/
 .pytest_cache/
 .coverage
 
-# Database
+# Database and uploaded evidence
 *.db
 *.sqlite
 *.sqlite3
+data/
+uploads/
 
 # Logs
 *.log
@@ -61,7 +63,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Testing
+# Testing and generated previews
 htmlcov/
 .tox/
 .hypothesis/
+tmp/

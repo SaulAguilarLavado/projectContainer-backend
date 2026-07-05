@@ -1,253 +1,326 @@
-"""
-Backend FastAPI para TextilControl
-API para gestión de talleres de confección y reparación textil
-"""
+"""API FastAPI de TextilControl para el avance APF3."""
 
-from fastapi import FastAPI, HTTPException, status
+import logging
+import json
+import os
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from models import (
-    LoginRequest, 
-    LoginResponse, 
-    Usuario, 
-    ErrorResponse,
-    RoleEnum
-)
+from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
+from pymysql.err import IntegrityError, MySQLError
+
 from database import (
-    verificar_credenciales,
+    actualizar_estado_reparacion,
+    actualizar_producto,
+    crear_producto,
+    crear_reparacion,
+    crear_usuario,
+    database_health,
+    eliminar_producto,
+    initialize_database,
+    obtener_producto,
+    obtener_productos,
+    obtener_reparacion,
+    obtener_reparaciones,
+    obtener_todos_usuarios,
     obtener_usuario_por_id,
-    obtener_todos_usuarios
+    verificar_credenciales,
+)
+from models import (
+    LoginRequest,
+    LoginResponse,
+    Producto,
+    ProductoCreate,
+    RegisterRequest,
+    Reparacion,
+    ReparacionCreate,
+    ReparacionEstadoUpdate,
+    Usuario,
 )
 
-# Crear aplicación FastAPI
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("textilcontrol.api")
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = Path(os.getenv("TEXTILCONTROL_UPLOAD_DIR", BASE_DIR / "uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+ALLOWED_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    logger.info("Inicializando esquema MySQL")
+    try:
+        initialize_database()
+    except MySQLError as exc:
+        logger.exception("No se pudo inicializar MySQL")
+        raise RuntimeError(
+            "No se pudo conectar con MySQL. Revisa que el servidor esté iniciado y las variables MYSQL_* sean correctas."
+        ) from exc
+    logger.info("Esquema MySQL listo")
+    yield
+
+
 app = FastAPI(
     title="TextilControl API",
-    description="API para la gestión de talleres de confección y reparación textil",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    description="Gestión de usuarios, reparaciones, evidencias fotográficas y estados.",
+    version="3.0.0",
+    lifespan=lifespan,
 )
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# Configurar CORS para permitir solicitudes desde React Native Expo
+
+def _cors_origins() -> list[str]:
+    raw_origins = os.getenv("CORS_ORIGINS", "*").strip()
+    if raw_origins.startswith("["):
+        try:
+            origins = json.loads(raw_origins)
+        except json.JSONDecodeError:
+            origins = [raw_origins]
+    else:
+        origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return ["*"] if "*" in origins else origins
+
+
+configured_origins = _cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8081",
-        "http://localhost:3000",
-        "http://192.168.1.*",
-        "http://127.0.0.1:*",
-        "*"  # En desarrollo, permitir todas las origins
-    ],
-    allow_credentials=True,
+    allow_origins=configured_origins,
+    allow_credentials=configured_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ============= RUTAS PÚBLICAS =============
+def _usuario_publico(row: dict) -> Usuario:
+    return Usuario(
+        id=row["id"], username=row["username"], email=row["email"],
+        nombre=row["nombre"], role=row["role"], activo=bool(row["activo"]),
+    )
 
-@app.get("/", tags=["Health"])
+
+def _reparacion_publica(row: dict, request: Request) -> Reparacion:
+    payload = dict(row)
+    if payload.get("foto_url"):
+        payload["foto_url"] = str(request.base_url).rstrip("/") + payload["foto_url"]
+    return Reparacion(**payload)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = uuid4().hex[:8]
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("request_failed id=%s method=%s path=%s", request_id, request.method, request.url.path)
+        raise
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "request id=%s method=%s path=%s status=%s duration_ms=%.1f",
+        request_id, request.method, request.url.path, response.status_code, elapsed_ms,
+    )
+    return response
+
+
+@app.get("/", tags=["Salud"])
 async def root():
-    """Endpoint raíz para verificar que la API está funcionando"""
-    return {
-        "mensaje": "Bienvenido a TextilControl API",
-        "version": "1.0.0",
-        "estado": "online"
-    }
+    return {"mensaje": "Bienvenido a TextilControl API", "version": "3.0.0", "estado": "online"}
 
 
-@app.get("/health", tags=["Health"])
-async def health_check():
-    """Verifica el estado de salud de la API"""
+@app.get("/health", tags=["Salud"])
+def health_check():
     return {
         "status": "healthy",
-        "servicio": "TextilControl API"
+        "servicio": "TextilControl API",
+        "version": "3.0.0",
+        "database": database_health(),
     }
 
 
-@app.post(
-    "/login",
-    response_model=LoginResponse,
-    status_code=status.HTTP_200_OK,
-    tags=["Autenticación"],
-    summary="Login de usuario",
-    description="Autentica un usuario con username y password"
-)
-async def login(credenciales: LoginRequest) -> LoginResponse:
-    """
-    Endpoint de login para autenticar usuarios
-    
-    **Usuarios de prueba disponibles:**
-    - Admin: username='admin', password='admin123'
-    - Costurera: username='costurera1', password='costurera123'
-    - Cliente: username='cliente1', password='cliente123'
-    - Cliente: username='cliente2', password='cliente123'
-    
-    Args:
-        credenciales: LoginRequest con username y password
-        
-    Returns:
-        LoginResponse con datos del usuario autenticado
-        
-    Raises:
-        HTTPException: Si las credenciales son inválidas
-    """
-    
-    # Validar entrada
-    if not credenciales.username or not credenciales.password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username y password son requeridos"
-        )
-    
-    # Verificar credenciales
-    usuario_db = verificar_credenciales(
-        credenciales.username,
-        credenciales.password
-    )
-    
-    if usuario_db is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario o contraseña incorrectos"
-        )
-    
-    if not usuario_db.activo:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="El usuario ha sido desactivado"
-        )
-    
-    # Crear respuesta sin la contraseña
-    usuario_respuesta = Usuario(
-        id=usuario_db.id,
-        username=usuario_db.username,
-        email=usuario_db.email,
-        nombre=usuario_db.nombre,
-        role=usuario_db.role,
-        activo=usuario_db.activo
-    )
-    
+@app.post("/login", response_model=LoginResponse, tags=["Autenticación"])
+async def login(credentials: LoginRequest) -> LoginResponse:
+    user = verificar_credenciales(credentials.username, credentials.password)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario o contraseña incorrectos")
+    if not user["activo"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="El usuario ha sido desactivado")
     return LoginResponse(
-        mensaje=f"¡Bienvenido {usuario_db.nombre}!",
-        usuario=usuario_respuesta,
-        token=None  # En futuro, aquí iría un JWT
+        mensaje=f"¡Bienvenido {user['nombre']}!",
+        usuario=_usuario_publico(user),
+        token=f"demo-{uuid4().hex}",
     )
+
+
+@app.post("/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED, tags=["Autenticación"])
+async def register(payload: RegisterRequest) -> LoginResponse:
+    try:
+        user = crear_usuario(payload.nombre, payload.email, payload.password, payload.username)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="El usuario o correo ya está registrado") from exc
+    return LoginResponse(
+        mensaje="Usuario registrado correctamente",
+        usuario=_usuario_publico(user),
+        token=f"demo-{uuid4().hex}",
+    )
+
+
+@app.get("/usuarios", response_model=list[Usuario], tags=["Usuarios"])
+async def list_users():
+    return [_usuario_publico(user) for user in obtener_todos_usuarios()]
+
+
+@app.get("/usuarios/{usuario_id}", response_model=Usuario, tags=["Usuarios"])
+async def get_user(usuario_id: int):
+    user = obtener_usuario_por_id(usuario_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
+    return _usuario_publico(user)
+
+
+@app.get("/reparaciones", response_model=list[Reparacion], tags=["Reparaciones"])
+async def list_repairs(request: Request, cliente_id: int | None = Query(default=None, gt=0)):
+    return [_reparacion_publica(repair, request) for repair in obtener_reparaciones(cliente_id)]
+
+
+@app.get("/reparaciones/{reparacion_id}", response_model=Reparacion, tags=["Reparaciones"])
+async def get_repair(reparacion_id: int, request: Request):
+    repair = obtener_reparacion(reparacion_id)
+    if repair is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reparación no encontrada")
+    return _reparacion_publica(repair, request)
 
 
 @app.post(
-    "/register",
-    response_model=LoginResponse,
+    "/reparaciones",
+    response_model=Reparacion,
     status_code=status.HTTP_201_CREATED,
-    tags=["Autenticación"],
-    summary="Registro de nuevo usuario (no implementado)",
+    tags=["Reparaciones"],
 )
-async def register(credenciales: LoginRequest):
-    """
-    Endpoint para registrar nuevos usuarios
-    
-    Nota: Para este avance, el registro no está implementado.
-    Use los usuarios predefinidos en la base de datos.
-    """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="El registro aún no está disponible. Use los usuarios predefinidos."
-    )
+async def create_repair(
+    request: Request,
+    cliente_id: int = Form(...),
+    prenda: str = Form(...),
+    descripcion: str = Form(""),
+    fecha_entrega: str = Form(...),
+    costo: float = Form(...),
+    ubicacion: str = Form(...),
+    foto: UploadFile | None = File(default=None),
+):
+    client = obtener_usuario_por_id(cliente_id)
+    if client is None or client["role"] != "cliente":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El cliente seleccionado no existe")
 
-
-# ============= RUTAS DE USUARIO =============
-
-@app.get(
-    "/usuarios/{usuario_id}",
-    response_model=Usuario,
-    tags=["Usuarios"],
-    summary="Obtener usuario por ID"
-)
-async def obtener_usuario(usuario_id: int):
-    """
-    Obtiene información de un usuario específico
-    
-    Args:
-        usuario_id: ID del usuario
-        
-    Returns:
-        Datos del usuario
-        
-    Raises:
-        HTTPException: Si el usuario no existe
-    """
-    usuario = obtener_usuario_por_id(usuario_id)
-    
-    if usuario is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Usuario con ID {usuario_id} no encontrado"
+    try:
+        payload = ReparacionCreate(
+            cliente_id=cliente_id,
+            prenda=prenda,
+            descripcion=descripcion,
+            fecha_entrega=fecha_entrega,
+            costo=costo,
+            ubicacion=ubicacion,
         )
-    
-    return Usuario(
-        id=usuario.id,
-        username=usuario.username,
-        email=usuario.email,
-        nombre=usuario.nombre,
-        role=usuario.role,
-        activo=usuario.activo
-    )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()[0]["msg"]) from exc
+
+    stored_path = None
+    saved_file = None
+    if foto is not None:
+        extension = ALLOWED_IMAGE_TYPES.get(foto.content_type or "")
+        if extension is None:
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="La evidencia debe ser JPG, PNG o WEBP")
+        content = await foto.read(MAX_IMAGE_BYTES + 1)
+        if not content:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La imagen está vacía")
+        if len(content) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="La imagen supera el límite de 5 MB")
+        filename = f"{uuid4().hex}{extension}"
+        saved_file = UPLOAD_DIR / filename
+        saved_file.write_bytes(content)
+        stored_path = f"/uploads/{filename}"
+
+    try:
+        repair = crear_reparacion(payload.model_dump(), stored_path)
+    except Exception:
+        if saved_file and saved_file.exists():
+            saved_file.unlink()
+        raise
+
+    logger.info("repair_created id=%s client_id=%s has_photo=%s", repair["id"], cliente_id, bool(stored_path))
+    return _reparacion_publica(repair, request)
 
 
-@app.get(
-    "/usuarios",
-    response_model=list[Usuario],
-    tags=["Usuarios"],
-    summary="Obtener todos los usuarios (solo para desarrollo)"
-)
-async def obtener_usuarios():
-    """
-    Obtiene la lista de todos los usuarios
-    
-    **Nota:** Este endpoint es solo para desarrollo.
-    En producción, debe estar protegido con autenticación.
-    
-    Returns:
-        Lista de usuarios sin contraseñas
-    """
-    usuarios = obtener_todos_usuarios()
-    return [
-        Usuario(
-            id=u.id,
-            username=u.username,
-            email=u.email,
-            nombre=u.nombre,
-            role=u.role,
-            activo=u.activo
-        )
-        for u in usuarios
-    ]
+@app.patch("/reparaciones/{reparacion_id}/estado", response_model=Reparacion, tags=["Reparaciones"])
+async def update_repair_status(reparacion_id: int, payload: ReparacionEstadoUpdate, request: Request):
+    repair = actualizar_estado_reparacion(reparacion_id, payload.estado.value)
+    if repair is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reparación no encontrada")
+    logger.info("repair_status_changed id=%s status=%s", reparacion_id, payload.estado.value)
+    return _reparacion_publica(repair, request)
 
 
-# ============= MANEJO DE ERRORES =============
+@app.get("/productos", response_model=list[Producto], tags=["Catálogo"])
+async def list_products():
+    return obtener_productos()
+
+
+@app.get("/productos/{producto_id}", response_model=Producto, tags=["Catálogo"])
+async def get_product(producto_id: int):
+    product = obtener_producto(producto_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+    return product
+
+
+@app.post("/productos", response_model=Producto, status_code=status.HTTP_201_CREATED, tags=["Catálogo"])
+async def create_product(payload: ProductoCreate):
+    product = crear_producto(payload.model_dump())
+    logger.info("product_created id=%s", product["id"])
+    return product
+
+
+@app.put("/productos/{producto_id}", response_model=Producto, tags=["Catálogo"])
+async def update_product(producto_id: int, payload: ProductoCreate):
+    product = actualizar_producto(producto_id, payload.model_dump())
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+    logger.info("product_updated id=%s", producto_id)
+    return product
+
+
+@app.delete("/productos/{producto_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Catálogo"])
+async def delete_product(producto_id: int):
+    if not eliminar_producto(producto_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+    logger.info("product_deleted id=%s", producto_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.exception_handler(MySQLError)
+async def mysql_error_handler(request: Request, exc: MySQLError):
+    logger.exception("mysql_error method=%s path=%s", request.method, request.url.path)
+    return JSONResponse(status_code=503, content={"detail": "Base de datos temporalmente no disponible"})
+
 
 @app.exception_handler(Exception)
-async def exception_handler(request, exc):
-    """Manejador global de excepciones"""
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detalle": "Error interno del servidor"}
-    )
+async def unexpected_error_handler(request: Request, exc: Exception):
+    logger.exception("unhandled_error method=%s path=%s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Error interno del servidor"})
 
 
 if __name__ == "__main__":
     import uvicorn
-    
-    print("=" * 60)
-    print("🚀 Iniciando TextilControl API")
-    print("=" * 60)
-    print("📍 URL: http://localhost:8000")
-    print("📚 Documentación: http://localhost:8000/docs")
-    print("=" * 60)
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
