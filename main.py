@@ -18,12 +18,14 @@ from pymysql.err import IntegrityError, MySQLError
 from database import (
     actualizar_estado_reparacion,
     actualizar_producto,
+    comprar_producto,
     crear_producto,
     crear_reparacion,
     crear_usuario,
     database_health,
     eliminar_producto,
     initialize_database,
+    obtener_compras,
     obtener_producto,
     obtener_productos,
     obtener_reparacion,
@@ -32,7 +34,10 @@ from database import (
     obtener_usuario_por_id,
     verificar_credenciales,
 )
+from database import StockInsuficienteError, CompraInvalidaError
 from models import (
+    Compra,
+    CompraCreate,
     LoginRequest,
     LoginResponse,
     Producto,
@@ -272,32 +277,114 @@ async def update_repair_status(reparacion_id: int, payload: ReparacionEstadoUpda
 
 
 @app.get("/productos", response_model=list[Producto], tags=["Catálogo"])
-async def list_products():
-    return obtener_productos()
+async def list_products(request: Request):
+    return [_producto_publico(product, request) for product in obtener_productos()]
 
 
 @app.get("/productos/{producto_id}", response_model=Producto, tags=["Catálogo"])
-async def get_product(producto_id: int):
+async def get_product(producto_id: int, request: Request):
     product = obtener_producto(producto_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
-    return product
+    return _producto_publico(product, request)
+
+
+def _producto_publico(row: dict, request: Request) -> Producto:
+    payload = dict(row)
+    if payload.get("foto_url"):
+        payload["foto_url"] = str(request.base_url).rstrip("/") + payload["foto_url"]
+    return Producto(**payload)
+
+
+def _save_photo(foto: UploadFile) -> tuple[str | None, Path | None]:
+    extension = ALLOWED_IMAGE_TYPES.get(foto.content_type or "")
+    if extension is None:
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="La foto debe ser JPG, PNG o WEBP")
+    content = foto.file.read(MAX_IMAGE_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La imagen está vacía")
+    if len(content) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="La imagen supera el límite de 5 MB")
+    filename = f"{uuid4().hex}{extension}"
+    saved_file = UPLOAD_DIR / filename
+    saved_file.write_bytes(content)
+    return f"/uploads/{filename}", saved_file
 
 
 @app.post("/productos", response_model=Producto, status_code=status.HTTP_201_CREATED, tags=["Catálogo"])
-async def create_product(payload: ProductoCreate):
-    product = crear_producto(payload.model_dump())
-    logger.info("product_created id=%s", product["id"])
-    return product
+async def create_product(
+    request: Request,
+    nombre: str = Form(...),
+    precio: float = Form(...),
+    stock: int = Form(...),
+    descripcion: str = Form(""),
+    foto: UploadFile | None = File(default=None),
+):
+    try:
+        payload = ProductoCreate(nombre=nombre, precio=precio, stock=stock, descripcion=descripcion)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()[0]["msg"]) from exc
+
+    stored_path = None
+    if foto is not None:
+        stored_path, _ = _save_photo(foto)
+
+    data = payload.model_dump()
+    data["foto_url"] = stored_path
+    product = crear_producto(data)
+    logger.info("product_created id=%s has_photo=%s", product["id"], bool(stored_path))
+    return _producto_publico(product, request)
 
 
 @app.put("/productos/{producto_id}", response_model=Producto, tags=["Catálogo"])
-async def update_product(producto_id: int, payload: ProductoCreate):
-    product = actualizar_producto(producto_id, payload.model_dump())
-    if product is None:
+async def update_product(
+    request: Request,
+    producto_id: int,
+    nombre: str = Form(...),
+    precio: float = Form(...),
+    stock: int = Form(...),
+    descripcion: str = Form(""),
+    foto: UploadFile | None = File(default=None),
+):
+    try:
+        payload = ProductoCreate(nombre=nombre, precio=precio, stock=stock, descripcion=descripcion)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()[0]["msg"]) from exc
+
+    existing_product = obtener_producto(producto_id)
+    if existing_product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+
+    stored_path = None
+    if foto is not None:
+        stored_path, _ = _save_photo(foto)
+    else:
+        stored_path = existing_product.get("foto_url")
+
+    data = payload.model_dump()
+    data["foto_url"] = stored_path
+    product = actualizar_producto(producto_id, data)
     logger.info("product_updated id=%s", producto_id)
-    return product
+    return _producto_publico(product, request)
+
+
+@app.post("/productos/{producto_id}/comprar", response_model=Compra, tags=["Compras"])
+async def buy_product(producto_id: int, payload: CompraCreate):
+    try:
+        purchase = comprar_producto(producto_id, payload.cliente_id, payload.cantidad)
+    except CompraInvalidaError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except StockInsuficienteError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if purchase is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+    logger.info("purchase_created product_id=%s client_id=%s qty=%s", producto_id, payload.cliente_id, payload.cantidad)
+    return purchase
+
+
+@app.get("/compras", response_model=list[Compra], tags=["Compras"])
+async def list_purchases(cliente_id: int | None = Query(default=None, gt=0)):
+    return obtener_compras(cliente_id)
 
 
 @app.delete("/productos/{producto_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Catálogo"])

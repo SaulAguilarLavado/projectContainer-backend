@@ -245,16 +245,16 @@ class TextilControlApiTests(unittest.TestCase):
     def test_06_product_crud(self):
         payload = {
             "nombre": "Agujas reforzadas",
-            "precio": 14.50,
-            "stock": 20,
+            "precio": "14.50",
+            "stock": "20",
             "descripcion": "Set para telas gruesas",
         }
-        created = self.client.post("/productos", json=payload)
+        created = self.client.post("/productos", data=payload)
         self.assertEqual(created.status_code, 201, created.text)
         product_id = created.json()["id"]
 
-        payload["stock"] = 35
-        updated = self.client.put(f"/productos/{product_id}", json=payload)
+        payload["stock"] = "35"
+        updated = self.client.put(f"/productos/{product_id}", data=payload)
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["stock"], 35)
 
